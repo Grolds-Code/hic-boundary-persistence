@@ -1,6 +1,6 @@
 # hic-boundary-persistence
 
-Persistence-weighted boundary hierarchy scoring for Hi-C topologically associating domains (TADs). Developed as part of the Fatima Institute AI Research Fellowship, under guidance from Dr. Muhammad Fatima.
+Persistence-weighted boundary hierarchy scoring for Hi-C topologically associating domains (TADs). Developed as part of the Fatima Institute AI Research Fellowship, under guidance from Dr. Muhammad Shamim.
 
 ## What this is
 
