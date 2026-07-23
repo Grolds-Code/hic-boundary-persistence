@@ -1,0 +1,5 @@
+hic-straw
+gudhi
+ripser
+numpy
+scipy
