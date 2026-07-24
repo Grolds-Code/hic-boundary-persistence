@@ -7,7 +7,7 @@ contact matrices for a genomic region at a given resolution.
 This is the first, purely exploratory script for the project:
 load one real .hic file, list what's in it, and pull one small
 region as a dense matrix so we can actually look at real data
-before writing any insulation-score or persistent-homology code.
+before writing any insulation-score or persistent-homology code. Something of the sort..
 """
 
 import numpy as np
