@@ -101,3 +101,35 @@ modal_app.py (function run_zscore_comparison).
 - Modal compute is reserved for anything that would otherwise use
   significant local bandwidth or compute time; single small-region
   pulls are safe to run locally.
+
+## 6. Stage 1 -- insulation score, and a fixed-threshold trap
+
+src/insulation.py had been an empty stub since the start of the
+project. Built the standard method (Crane et al. 2015): a sliding
+window along the diagonal, boundaries called at local minima of the
+log2 insulation score.
+
+Validated on synthetic data first (same discipline as Stage 2): all 4
+planted boundaries recovered correctly, ranked correctly by
+prominence, no false positives ahead of them.
+
+On real data, the first run found 0 boundaries. Diagnosis (via a
+dedicated diagnostic Modal function, not guessing) showed why: the
+prominence threshold (0.15) was tuned against the synthetic test's
+deliberately dramatic 10:1 domain-to-background contrast, which
+produced large prominence values. Real biological insulation dips are
+far subtler -- the maximum possible prominence in the real data tested
+was 0.0707, less than half the threshold, so nothing could ever pass.
+
+Fix: switched from a fixed absolute prominence threshold to a
+percentile-based one (keep the top half of detected dips, regardless
+of their absolute scale). This adapts to whatever data it is run on,
+rather than requiring hand-tuning per dataset. After the fix: 27
+candidate boundaries found on the same chr21 2Mb region. See
+src/insulation.py and modal_app.py (function run_insulation).
+
+General lesson: any threshold validated only on synthetic data should
+be treated as unvalidated for real data until checked directly --
+this is the second time in this project a synthetic-only parameter
+choice failed silently on real data (the first being the 300kb
+distance-band cutoff).

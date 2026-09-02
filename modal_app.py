@@ -68,9 +68,7 @@ def run_sweep():
         m = mask_long_range(m, bins)
         h0 = run_cubical_persistence(m)
         pers = sorted_persistences(h0)
-
         plt.plot(pers[:100], marker="o", markersize=2, label=f"{kb}kb")
-
         top10 = pers[:10]
         rest = pers[10:60] if len(pers) > 60 else pers[10:]
         gap = (top10.min() - rest.max()) if len(rest) > 0 else float("nan")
@@ -178,18 +176,173 @@ def run_zscore_comparison():
     return buf.getvalue(), "\n".join(summary_lines)
 
 
-@app.local_entrypoint()
-def main():
-    image_bytes, summary = run_sweep.remote()
-    with open("figures/distance_band_sweep_extended.png", "wb") as f:
-        f.write(image_bytes)
-    print("=== Cutoff sweep ===")
-    print(summary)
-    print("Saved figures/distance_band_sweep_extended.png\n")
+@app.function(image=image, timeout=1800)
+def run_insulation():
+    import io
 
-    zimage_bytes, zsummary = run_zscore_comparison.remote()
-    with open("figures/zscore_window_test.png", "wb") as f:
-        f.write(zimage_bytes)
-    print("=== Z-score window-size test ===")
-    print(zsummary)
-    print("Saved figures/zscore_window_test.png")
+    import hicstraw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def load_hic(url="https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_30.hic"):
+        return hicstraw.HiCFile(url)
+
+    def get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="observed"):
+        mzd = hic.getMatrixZoomData(chrom, chrom, data_type, normalization, "BP", resolution)
+        return mzd.getRecordsAsMatrix(start, end, start, end)
+
+    def insulation_score(matrix, window):
+        n = matrix.shape[0]
+        scores = np.full(n, np.nan)
+        for i in range(window, n - window):
+            block = matrix[i - window:i, i:i + window]
+            scores[i] = block.mean()
+        return scores
+
+    def call_boundaries(scores, percentile=50):
+        # percentile-based, not a fixed absolute number -- real
+        # prominence scale depends heavily on the data and window size
+        # (biological insulation dips are far subtler than the
+        # deliberately dramatic synthetic test), so a fixed threshold
+        # tuned on one dataset does not transfer to another
+        log_scores = np.log2(scores + 1e-9)
+        valid = ~np.isnan(log_scores)
+        idx = np.where(valid)[0]
+        vals = log_scores[idx]
+        all_boundaries = []
+        for k in range(1, len(vals) - 1):
+            if vals[k] < vals[k - 1] and vals[k] < vals[k + 1]:
+                prominence = min(vals[k - 1], vals[k + 1]) - vals[k]
+                all_boundaries.append((idx[k], prominence))
+        if not all_boundaries:
+            return []
+        cutoff = np.percentile([p for _, p in all_boundaries], percentile)
+        return [(b, p) for b, p in all_boundaries if p >= cutoff]
+
+    hic = load_hic()
+    chrom, resolution = "21", 10000
+    start, end = 20_000_000, 22_000_000
+    matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR")
+
+    window_bins = 8
+    scores = insulation_score(matrix, window_bins)
+    boundaries = call_boundaries(scores, percentile=50)  # keep top half by prominence
+    boundaries.sort(key=lambda x: -x[1])
+
+    summary_lines = [f"Found {len(boundaries)} candidate boundaries (window={window_bins} bins)"]
+    summary_lines.append("Top 10 by prominence:")
+    for bin_idx, prom in boundaries[:10]:
+        genomic_pos = start + bin_idx * resolution
+        summary_lines.append(f"  bin={bin_idx}  position={genomic_pos:,} bp  prominence={prom:.3f}")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    ax1.imshow(np.log1p(matrix), cmap="Reds", origin="upper")
+    for bin_idx, prom in boundaries[:15]:
+        ax1.axvline(bin_idx, color="blue", linewidth=0.8, alpha=0.6)
+        ax1.axhline(bin_idx, color="blue", linewidth=0.8, alpha=0.6)
+    ax1.set_title(f"chr{chrom}:{start}-{end}, GM12878, {resolution}bp -- top insulation boundaries")
+
+    ax2.plot(scores)
+    for bin_idx, prom in boundaries[:15]:
+        ax2.axvline(bin_idx, color="blue", linewidth=0.8, alpha=0.6)
+    ax2.set_ylabel("Insulation score")
+    ax2.set_xlabel("Bin")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    return buf.getvalue(), "\n".join(summary_lines)
+
+
+@app.function(image=image, timeout=600)
+def diagnose_insulation():
+    import hicstraw
+    import numpy as np
+
+    def load_hic(url="https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_30.hic"):
+        return hicstraw.HiCFile(url)
+
+    def get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="observed"):
+        mzd = hic.getMatrixZoomData(chrom, chrom, data_type, normalization, "BP", resolution)
+        return mzd.getRecordsAsMatrix(start, end, start, end)
+
+    def insulation_score(matrix, window):
+        n = matrix.shape[0]
+        scores = np.full(n, np.nan)
+        for i in range(window, n - window):
+            block = matrix[i - window:i, i:i + window]
+            scores[i] = block.mean()
+        return scores
+
+    hic = load_hic()
+    chrom, resolution = "21", 10000
+    start, end = 20_000_000, 22_000_000
+    matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR")
+
+    lines = [f"matrix shape: {matrix.shape}"]
+    lines.append(f"matrix has NaN: {np.isnan(matrix).any()}  count: {np.isnan(matrix).sum()}")
+    lines.append(f"matrix min/max/mean: {np.nanmin(matrix):.3f} / {np.nanmax(matrix):.3f} / {np.nanmean(matrix):.3f}")
+
+    for window in [4, 8, 15]:
+        scores = insulation_score(matrix, window)
+        valid = scores[~np.isnan(scores)]
+        log_scores = np.log2(valid + 1e-9)
+
+        # count raw local minima with NO threshold at all
+        raw_minima = 0
+        for k in range(1, len(log_scores) - 1):
+            if log_scores[k] < log_scores[k-1] and log_scores[k] < log_scores[k+1]:
+                raw_minima += 1
+
+        # actual prominence values for those raw minima
+        prominences = []
+        for k in range(1, len(log_scores) - 1):
+            if log_scores[k] < log_scores[k-1] and log_scores[k] < log_scores[k+1]:
+                prominences.append(min(log_scores[k-1], log_scores[k+1]) - log_scores[k])
+
+        lines.append(f"\nwindow={window}: valid_bins={len(valid)}  raw_local_minima={raw_minima}")
+        if prominences:
+            lines.append(f"  prominence distribution: min={min(prominences):.4f} max={max(prominences):.4f} "
+                          f"median={np.median(prominences):.4f} mean={np.mean(prominences):.4f}")
+        lines.append(f"  log2 score range: min={log_scores.min():.3f} max={log_scores.max():.3f} std={log_scores.std():.3f}")
+
+    return "\n".join(lines)
+
+
+@app.local_entrypoint()
+def main(task: str = "insulation"):
+    if task == "diagnose":
+        print(diagnose_insulation.remote())
+
+    elif task == "insulation":
+        image_bytes, summary = run_insulation.remote()
+        with open("figures/insulation_boundaries.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/insulation_boundaries.png")
+
+    elif task == "sweep":
+        image_bytes, summary = run_sweep.remote()
+        with open("figures/distance_band_sweep_extended.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/distance_band_sweep_extended.png")
+
+    elif task == "zscore":
+        image_bytes, summary = run_zscore_comparison.remote()
+        with open("figures/zscore_window_test.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/zscore_window_test.png")
+
+    elif task == "all":
+        for t in ["insulation", "sweep", "zscore"]:
+            main(task=t)
+
+    else:
+        print(f"Unknown task '{task}'. Choose from: insulation, sweep, zscore, all")
