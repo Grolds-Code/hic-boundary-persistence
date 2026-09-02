@@ -314,9 +314,153 @@ def diagnose_insulation():
     return "\n".join(lines)
 
 
+@app.function(image=image, timeout=1800)
+def run_integration():
+    import io
+
+    import gudhi
+    import hicstraw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy.stats import spearmanr
+
+    def load_hic(url="https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_30.hic"):
+        return hicstraw.HiCFile(url)
+
+    def get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="observed"):
+        mzd = hic.getMatrixZoomData(chrom, chrom, data_type, normalization, "BP", resolution)
+        return mzd.getRecordsAsMatrix(start, end, start, end)
+
+    def insulation_score(matrix, window):
+        n = matrix.shape[0]
+        scores = np.full(n, np.nan)
+        for i in range(window, n - window):
+            block = matrix[i - window:i, i:i + window]
+            scores[i] = block.mean()
+        return scores
+
+    def call_boundaries(scores, percentile=50):
+        log_scores = np.log2(scores + 1e-9)
+        valid = ~np.isnan(log_scores)
+        idx = np.where(valid)[0]
+        vals = log_scores[idx]
+        all_b = []
+        for k in range(1, len(vals) - 1):
+            if vals[k] < vals[k - 1] and vals[k] < vals[k + 1]:
+                prom = min(vals[k - 1], vals[k + 1]) - vals[k]
+                all_b.append((idx[k], prom))
+        if not all_b:
+            return []
+        cutoff = np.percentile([p for _, p in all_b], percentile)
+        return [(b, p) for b, p in all_b if p >= cutoff]
+
+    def mask_diagonal(matrix):
+        masked = matrix.copy()
+        off = matrix[~np.eye(matrix.shape[0], dtype=bool)]
+        bg = np.median(off[off > 0]) if np.any(off > 0) else 0
+        np.fill_diagonal(masked, bg)
+        return masked
+
+    def domain_persistence(matrix, b_start, b_end, margin=3):
+        n = matrix.shape[0]
+        lo = max(0, b_start - margin)
+        hi = min(n, b_end + margin)
+        sub = matrix[lo:hi, lo:hi]
+        sub = mask_diagonal(sub)
+        filt = -sub
+        cc = gudhi.CubicalComplex(top_dimensional_cells=filt)
+        cc.compute_persistence()
+        h0 = cc.persistence_intervals_in_dimension(0)
+        finite = h0[np.isfinite(h0[:, 1])]
+        if len(finite) == 0:
+            return 0.0
+        pers = finite[:, 1] - finite[:, 0]
+        return pers.max()
+
+    hic = load_hic()
+    chrom, resolution = "21", 10000
+    start, end = 20_000_000, 22_000_000
+
+    # Stage 1 uses raw KR-normalized observed counts, matching the
+    # original design (insulation.py) -- unchanged from current field practice
+    kr_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR")
+    # Stage 2 uses O/E, per Findings 1 and 2 -- raw counts are dominated
+    # by distance decay, which O/E corrects for
+    oe_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="oe")
+
+    window_bins = 8
+    scores = insulation_score(kr_matrix, window_bins)
+    boundaries = call_boundaries(scores, percentile=50)
+    boundaries.sort(key=lambda x: x[0])
+
+    positions = sorted(set([0] + [b for b, p in boundaries] + [kr_matrix.shape[0]]))
+
+    results = []
+    for i in range(len(positions) - 1):
+        b_start, b_end = positions[i], positions[i + 1]
+        if b_end - b_start < 2:
+            continue
+        pers = domain_persistence(oe_matrix, b_start, b_end)
+        prom_candidates = [p for b, p in boundaries if b in (b_start, b_end)]
+        weak_prom = min(prom_candidates) if prom_candidates else float("nan")
+        results.append((b_start, b_end, weak_prom, pers))
+
+    # domains under 5 bins barely have room for a meaningful persistence
+    # computation and are likely just noise -- exclude them rather than
+    # let them dilute the comparison between the two methods
+    min_domain_size = 5
+    n_before = len(results)
+    results = [r for r in results if (r[1] - r[0]) >= min_domain_size]
+    n_dropped = n_before - len(results)
+
+    summary_lines = [f"Stage 1 found {len(boundaries)} boundaries -> {n_before} candidate domains "
+                      f"({n_dropped} dropped for being under {min_domain_size} bins, {len(results)} kept)\n"]
+    summary_lines.append(f"{'domain':>15} {'stage1_prominence':>18} {'stage2_persistence':>18}")
+    for b_start, b_end, prom, pers in results:
+        prom_str = f"{prom:.4f}" if not np.isnan(prom) else "n/a"
+        summary_lines.append(f"[{b_start:>4},{b_end:>4}] {prom_str:>18} {pers:>18.3f}")
+
+    proms = [r[2] for r in results if not np.isnan(r[2])]
+    perss = [r[3] for r in results if not np.isnan(r[2])]
+    if len(proms) > 2:
+        rho, pval = spearmanr(proms, perss)
+        summary_lines.append(f"\nSpearman correlation (Stage1 prominence vs Stage2 persistence): "
+                              f"rho={rho:.3f}  p={pval:.3f}")
+        summary_lines.append("(This is Claim 1's actual question, on one region: do the two methods")
+        summary_lines.append("rank boundaries the same way? Low/insignificant correlation would mean")
+        summary_lines.append("persistence is capturing something insulation score does not -- which")
+        summary_lines.append("could support persistence as a genuinely different signal, not just a")
+        summary_lines.append("noisier version of the same one. This is one region, not the full")
+        summary_lines.append("benchmark -- a real result needs many regions and the CTCF/cohesin")
+        summary_lines.append("proxy metrics from the paper's Section 4.5.")
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    if len(proms) > 0:
+        ax.scatter(proms, perss)
+        ax.set_xlabel("Stage 1: insulation-score prominence")
+        ax.set_ylabel("Stage 2: persistence")
+        ax.set_title("Do the two methods rank domains the same way?")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    return buf.getvalue(), "\n".join(summary_lines)
+
+
 @app.local_entrypoint()
 def main(task: str = "insulation"):
-    if task == "diagnose":
+    if task == "integrate":
+        image_bytes, summary = run_integration.remote()
+        with open("figures/stage1_stage2_integration.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/stage1_stage2_integration.png")
+
+    elif task == "diagnose":
         print(diagnose_insulation.remote())
 
     elif task == "insulation":

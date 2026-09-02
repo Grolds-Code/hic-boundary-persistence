@@ -133,3 +133,24 @@ be treated as unvalidated for real data until checked directly --
 this is the second time in this project a synthetic-only parameter
 choice failed silently on real data (the first being the 300kb
 distance-band cutoff).
+
+## 7. First real attempt at Claim 1 -- inconclusive, and why that's honest
+
+Built the actual integration this project has been building toward:
+for each pair of consecutive Stage 1 boundaries, treat the region
+between them as a candidate domain, run Stage 2 persistence within it,
+and compare the resulting ranking against Stage 1's own insulation-
+score prominence ranking for the same domains. This is Claim 1's
+actual question, tested for the first time.
+
+First pass (28 domains, one 2Mb region): Spearman rho=-0.205, p=0.296.
+After dropping domains under 5 bins (too small for persistence to mean
+much, likely just noise): 15 domains, rho=0.064, p=0.819.
+
+Neither result is statistically distinguishable from zero correlation.
+This is not evidence that persistence and insulation score agree or
+disagree -- it means one 2Mb window is not enough data to say anything
+yet. 15-28 domains is a pilot, not a sample. The honest conclusion at
+this point is that Claim 1 needs a real sample: multiple regions,
+likely multiple chromosomes, before the correlation (or lack of one)
+means anything. See modal_app.py (function run_integration).
