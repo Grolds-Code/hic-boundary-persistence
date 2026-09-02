@@ -154,3 +154,24 @@ yet. 15-28 domains is a pilot, not a sample. The honest conclusion at
 this point is that Claim 1 needs a real sample: multiple regions,
 likely multiple chromosomes, before the correlation (or lack of one)
 means anything. See modal_app.py (function run_integration).
+
+## 8. Multi-region Claim 1 test -- first statistically significant result
+
+Pooled the Stage1-vs-Stage2 domain comparison across 8 regions (5
+windows on chr21, 3 on chr20) instead of one, to get real statistical
+power. 107 domains total.
+
+Result: rho=0.234, p=0.0155 -- statistically significant at
+alpha=0.05, unlike either single-region attempt. The correlation is
+real but weak: rho^2 suggests only about 5% of the variance in one
+method is explained by the other. Read together, this means the two
+methods are not independent (makes sense, both track real boundary
+strength to some extent) but are also far from redundant -- a strong
+signal that persistence is capturing something insulation-score
+prominence does not, which is the core premise Claim 1 is built on.
+
+Important caveat: this correlation tells us how similar the two
+methods are, not which one is more biologically accurate. That
+question needs the actual CTCF/cohesin enrichment benchmark (paper
+Section 4.5), not yet built. See modal_app.py (function
+run_integration_multiregion).

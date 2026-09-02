@@ -451,9 +451,160 @@ def run_integration():
     return buf.getvalue(), "\n".join(summary_lines)
 
 
+@app.function(image=image, timeout=3600)
+def run_integration_multiregion():
+    import io
+
+    import gudhi
+    import hicstraw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy.stats import spearmanr
+
+    def load_hic(url="https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_30.hic"):
+        return hicstraw.HiCFile(url)
+
+    def get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="observed"):
+        mzd = hic.getMatrixZoomData(chrom, chrom, data_type, normalization, "BP", resolution)
+        return mzd.getRecordsAsMatrix(start, end, start, end)
+
+    def insulation_score(matrix, window):
+        n = matrix.shape[0]
+        scores = np.full(n, np.nan)
+        for i in range(window, n - window):
+            block = matrix[i - window:i, i:i + window]
+            scores[i] = block.mean()
+        return scores
+
+    def call_boundaries(scores, percentile=50):
+        log_scores = np.log2(scores + 1e-9)
+        valid = ~np.isnan(log_scores)
+        idx = np.where(valid)[0]
+        vals = log_scores[idx]
+        all_b = []
+        for k in range(1, len(vals) - 1):
+            if vals[k] < vals[k - 1] and vals[k] < vals[k + 1]:
+                prom = min(vals[k - 1], vals[k + 1]) - vals[k]
+                all_b.append((idx[k], prom))
+        if not all_b:
+            return []
+        cutoff = np.percentile([p for _, p in all_b], percentile)
+        return [(b, p) for b, p in all_b if p >= cutoff]
+
+    def mask_diagonal(matrix):
+        masked = matrix.copy()
+        off = matrix[~np.eye(matrix.shape[0], dtype=bool)]
+        bg = np.median(off[off > 0]) if np.any(off > 0) else 0
+        np.fill_diagonal(masked, bg)
+        return masked
+
+    def domain_persistence(matrix, b_start, b_end, margin=3):
+        n = matrix.shape[0]
+        lo = max(0, b_start - margin)
+        hi = min(n, b_end + margin)
+        sub = matrix[lo:hi, lo:hi]
+        sub = mask_diagonal(sub)
+        filt = -sub
+        cc = gudhi.CubicalComplex(top_dimensional_cells=filt)
+        cc.compute_persistence()
+        h0 = cc.persistence_intervals_in_dimension(0)
+        finite = h0[np.isfinite(h0[:, 1])]
+        if len(finite) == 0:
+            return 0.0
+        pers = finite[:, 1] - finite[:, 0]
+        return pers.max()
+
+    def process_region(hic, chrom, start, end, resolution=10000, min_domain_size=5):
+        kr_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR")
+        oe_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="oe")
+
+        scores = insulation_score(kr_matrix, window=8)
+        boundaries = call_boundaries(scores, percentile=50)
+        boundaries.sort(key=lambda x: x[0])
+
+        positions = sorted(set([0] + [b for b, p in boundaries] + [kr_matrix.shape[0]]))
+
+        region_results = []
+        for i in range(len(positions) - 1):
+            b_start, b_end = positions[i], positions[i + 1]
+            if b_end - b_start < min_domain_size:
+                continue
+            pers = domain_persistence(oe_matrix, b_start, b_end)
+            prom_candidates = [p for b, p in boundaries if b in (b_start, b_end)]
+            weak_prom = min(prom_candidates) if prom_candidates else float("nan")
+            if not np.isnan(weak_prom):
+                region_results.append((b_start, b_end, weak_prom, pers))
+        return region_results
+
+    hic = load_hic()
+    resolution = 10000
+
+    # spread across several non-adjacent windows on chr21, plus a
+    # second chromosome (chr20), to get real statistical power instead
+    # of one region's worth of domains
+    regions = [
+        ("21", 20_000_000, 22_000_000),
+        ("21", 25_000_000, 27_000_000),
+        ("21", 30_000_000, 32_000_000),
+        ("21", 35_000_000, 37_000_000),
+        ("21", 40_000_000, 42_000_000),
+        ("20", 20_000_000, 22_000_000),
+        ("20", 30_000_000, 32_000_000),
+        ("20", 40_000_000, 42_000_000),
+    ]
+
+    pooled = []
+    summary_lines = []
+    for chrom, start, end in regions:
+        try:
+            region_results = process_region(hic, chrom, start, end, resolution)
+            summary_lines.append(f"chr{chrom}:{start}-{end}  ->  {len(region_results)} domains (>=5 bins)")
+            for b_start, b_end, prom, pers in region_results:
+                pooled.append((f"chr{chrom}:{start}-{end}", b_start, b_end, prom, pers))
+        except Exception as e:
+            summary_lines.append(f"chr{chrom}:{start}-{end}  ->  FAILED: {e}")
+
+    summary_lines.append(f"\nTotal pooled domains: {len(pooled)}")
+
+    proms = [r[3] for r in pooled]
+    perss = [r[4] for r in pooled]
+
+    if len(pooled) > 5:
+        rho, pval = spearmanr(proms, perss)
+        summary_lines.append(f"\nPooled Spearman correlation (Stage1 prominence vs Stage2 persistence): "
+                              f"rho={rho:.3f}  p={pval:.4f}  n={len(pooled)}")
+        if pval < 0.05:
+            summary_lines.append("Statistically significant at alpha=0.05.")
+        else:
+            summary_lines.append("Not statistically significant at alpha=0.05 -- still inconclusive,")
+            summary_lines.append("though with more regions than the single-window pilot.")
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(proms, perss, alpha=0.6)
+    ax.set_xlabel("Stage 1: insulation-score prominence")
+    ax.set_ylabel("Stage 2: persistence")
+    ax.set_title(f"Pooled across {len(regions)} regions, n={len(pooled)} domains")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    return buf.getvalue(), "\n".join(summary_lines)
+
+
 @app.local_entrypoint()
 def main(task: str = "insulation"):
-    if task == "integrate":
+    if task == "integrate_multi":
+        image_bytes, summary = run_integration_multiregion.remote()
+        with open("figures/stage1_stage2_multiregion.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/stage1_stage2_multiregion.png")
+
+    elif task == "integrate":
         image_bytes, summary = run_integration.remote()
         with open("figures/stage1_stage2_integration.png", "wb") as f:
             f.write(image_bytes)
