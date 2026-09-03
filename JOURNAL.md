@@ -175,3 +175,29 @@ methods are, not which one is more biologically accurate. That
 question needs the actual CTCF/cohesin enrichment benchmark (paper
 Section 4.5), not yet built. See modal_app.py (function
 run_integration_multiregion).
+
+## 9. First real test against biological ground truth -- promising, not yet proven
+
+Built the actual CTCF/cohesin benchmark from the paper's Section 4.5:
+fetched real ChIP-seq peaks for GM12878 (CTCF: ENCFF833FTF, RAD21:
+ENCFF753RGL, SMC3: ENCFF572RPI, all confirmed hg19 to match the Hi-C
+data -- one candidate CTCF file, ENCFF797SDL, was correctly rejected
+after checking, since it turned out to be hg38). For each of the 107
+domains from the multi-region test, checked whether a real peak sits
+near the boundary, then tested whether Stage 1 (insulation prominence)
+or Stage 2 (persistence) ranking better predicts that.
+
+Point estimates favor persistence on both markers: CTCF AUC 0.646
+(Stage 2) vs 0.561 (Stage 1); cohesin AUC 0.572 (Stage 2) vs 0.473
+(Stage 1) -- notably, Stage 1 performed at or below random chance
+(AUC 0.5) for predicting cohesin binding.
+
+However, a paired bootstrap 95% confidence interval on the AUC
+difference includes zero for both markers (CTCF: [-0.063, 0.224];
+cohesin: [-0.064, 0.260]). This means the apparent advantage for
+persistence, while a real and encouraging direction, cannot yet be
+distinguished from chance at n=107 domains from 8 regions on 2
+chromosomes. This is not a negative result -- it is the honest,
+correct read of a promising but underpowered first test. More regions
+and more chromosomes are needed before this becomes a claim rather
+than a direction. See modal_app.py (function run_ctcf_benchmark).
