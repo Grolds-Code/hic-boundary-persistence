@@ -850,9 +850,259 @@ def run_ctcf_benchmark():
     return buf.getvalue(), "\n".join(summary_lines)
 
 
+@app.function(image=image, timeout=5400)
+def run_ctcf_benchmark_expanded():
+    """
+    Expanded version of run_ctcf_benchmark -- same logic entirely,
+    just spread across many more regions (22 vs 8, 5 chromosomes vs 2)
+    to tighten the bootstrap confidence intervals that were too wide
+    to be conclusive in the first pass. run_ctcf_benchmark itself is
+    left untouched; this is a new, separate function so the original
+    validated result stays intact and reproducible on its own.
+    """
+    import io
+    import urllib.request
+
+    import gudhi
+    import hicstraw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def load_hic(url="https://hicfiles.s3.amazonaws.com/hiseq/gm12878/in-situ/combined_30.hic"):
+        return hicstraw.HiCFile(url)
+
+    def get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="observed"):
+        mzd = hic.getMatrixZoomData(chrom, chrom, data_type, normalization, "BP", resolution)
+        return mzd.getRecordsAsMatrix(start, end, start, end)
+
+    def insulation_score(matrix, window):
+        n = matrix.shape[0]
+        scores = np.full(n, np.nan)
+        for i in range(window, n - window):
+            block = matrix[i - window:i, i:i + window]
+            scores[i] = block.mean()
+        return scores
+
+    def call_boundaries(scores, percentile=50):
+        log_scores = np.log2(scores + 1e-9)
+        valid = ~np.isnan(log_scores)
+        idx = np.where(valid)[0]
+        vals = log_scores[idx]
+        all_b = []
+        for k in range(1, len(vals) - 1):
+            if vals[k] < vals[k - 1] and vals[k] < vals[k + 1]:
+                prom = min(vals[k - 1], vals[k + 1]) - vals[k]
+                all_b.append((idx[k], prom))
+        if not all_b:
+            return []
+        cutoff = np.percentile([p for _, p in all_b], percentile)
+        return [(b, p) for b, p in all_b if p >= cutoff]
+
+    def mask_diagonal(matrix):
+        masked = matrix.copy()
+        off = matrix[~np.eye(matrix.shape[0], dtype=bool)]
+        bg = np.median(off[off > 0]) if np.any(off > 0) else 0
+        np.fill_diagonal(masked, bg)
+        return masked
+
+    def domain_persistence(matrix, b_start, b_end, margin=3):
+        n = matrix.shape[0]
+        lo = max(0, b_start - margin)
+        hi = min(n, b_end + margin)
+        sub = matrix[lo:hi, lo:hi]
+        sub = mask_diagonal(sub)
+        filt = -sub
+        cc = gudhi.CubicalComplex(top_dimensional_cells=filt)
+        cc.compute_persistence()
+        h0 = cc.persistence_intervals_in_dimension(0)
+        finite = h0[np.isfinite(h0[:, 1])]
+        if len(finite) == 0:
+            return 0.0
+        pers = finite[:, 1] - finite[:, 0]
+        return pers.max()
+
+    def fetch_peaks(url, chroms):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read()
+        import gzip
+        text = gzip.decompress(raw).decode("utf-8") if url.endswith(".gz") else raw.decode("utf-8")
+        peaks = {c: [] for c in chroms}
+        for line in text.strip().split("\n"):
+            fields = line.split("\t")
+            chrom = fields[0].replace("chr", "")
+            if chrom in peaks:
+                start, end = int(fields[1]), int(fields[2])
+                peaks[chrom].append((start, end))
+        return peaks
+
+    def has_nearby_peak(genomic_pos, peak_list, window=20000):
+        for (p_start, p_end) in peak_list:
+            if p_start - window <= genomic_pos <= p_end + window:
+                return True
+        return False
+
+    def rank_auc(scores, labels):
+        scores = np.asarray(scores)
+        labels = np.asarray(labels)
+        n_pos = labels.sum()
+        n_neg = len(labels) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return float("nan")
+        ranks = np.argsort(np.argsort(scores)) + 1
+        sum_ranks_pos = ranks[labels == 1].sum()
+        return (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+
+    def bootstrap_auc_diff(scores_stage1, scores_stage2, labels, n_boot=2000, seed=0):
+        rng = np.random.default_rng(seed)
+        scores_stage1 = np.asarray(scores_stage1)
+        scores_stage2 = np.asarray(scores_stage2)
+        labels = np.asarray(labels)
+        n = len(labels)
+        diffs = []
+        for _ in range(n_boot):
+            idx = rng.integers(0, n, n)
+            auc1 = rank_auc(scores_stage1[idx], labels[idx])
+            auc2 = rank_auc(scores_stage2[idx], labels[idx])
+            if not (np.isnan(auc1) or np.isnan(auc2)):
+                diffs.append(auc2 - auc1)
+        diffs = np.array(diffs)
+        ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])
+        return diffs.mean(), ci_low, ci_high
+
+    chroms_needed = ["18", "19", "20", "21", "22"]
+    summary_lines = ["Fetching ChIP-seq peak files..."]
+
+    ctcf_peaks = fetch_peaks(
+        "https://www.encodeproject.org/files/ENCFF833FTF/@@download/ENCFF833FTF.bed.gz",
+        chroms_needed,
+    )
+    rad21_peaks = fetch_peaks(
+        "https://www.encodeproject.org/files/ENCFF753RGL/@@download/ENCFF753RGL.bed.gz",
+        chroms_needed,
+    )
+    smc3_peaks = fetch_peaks(
+        "https://www.encodeproject.org/files/ENCFF572RPI/@@download/ENCFF572RPI.bed.gz",
+        chroms_needed,
+    )
+
+    for name, peaks in [("CTCF", ctcf_peaks), ("RAD21", rad21_peaks), ("SMC3", smc3_peaks)]:
+        counts = {c: len(v) for c, v in peaks.items()}
+        summary_lines.append(f"{name}: {counts}")
+
+    def process_region(hic, chrom, start, end, resolution=10000, min_domain_size=5):
+        kr_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR")
+        oe_matrix = get_matrix(hic, chrom, start, end, resolution, normalization="KR", data_type="oe")
+
+        scores = insulation_score(kr_matrix, window=8)
+        boundaries = call_boundaries(scores, percentile=50)
+        boundaries.sort(key=lambda x: x[0])
+
+        positions = sorted(set([0] + [b for b, p in boundaries] + [kr_matrix.shape[0]]))
+
+        region_results = []
+        for i in range(len(positions) - 1):
+            b_start, b_end = positions[i], positions[i + 1]
+            if b_end - b_start < min_domain_size:
+                continue
+            pers = domain_persistence(oe_matrix, b_start, b_end)
+            prom_candidates = [p for b, p in boundaries if b in (b_start, b_end)]
+            weak_prom = min(prom_candidates) if prom_candidates else float("nan")
+            if np.isnan(weak_prom):
+                continue
+
+            genomic_start = start + b_start * resolution
+            genomic_end = start + b_end * resolution
+            has_ctcf = (has_nearby_peak(genomic_start, ctcf_peaks[chrom]) or
+                        has_nearby_peak(genomic_end, ctcf_peaks[chrom]))
+            has_cohesin = (has_nearby_peak(genomic_start, rad21_peaks[chrom]) or
+                           has_nearby_peak(genomic_end, rad21_peaks[chrom]) or
+                           has_nearby_peak(genomic_start, smc3_peaks[chrom]) or
+                           has_nearby_peak(genomic_end, smc3_peaks[chrom]))
+
+            region_results.append((weak_prom, pers, has_ctcf, has_cohesin))
+        return region_results
+
+    hic = load_hic()
+    resolution = 10000
+
+    regions = []
+    for start_mb in [20, 30, 40, 50, 60, 70]:
+        regions.append(("18", start_mb * 1_000_000, start_mb * 1_000_000 + 2_000_000))
+    for start_mb in [20, 30, 40, 50]:
+        regions.append(("19", start_mb * 1_000_000, start_mb * 1_000_000 + 2_000_000))
+    for start_mb in [20, 30, 40, 50]:
+        regions.append(("20", start_mb * 1_000_000, start_mb * 1_000_000 + 2_000_000))
+    for start_mb in [20, 25, 30, 35, 40]:
+        regions.append(("21", start_mb * 1_000_000, start_mb * 1_000_000 + 2_000_000))
+    for start_mb in [20, 30, 40]:
+        regions.append(("22", start_mb * 1_000_000, start_mb * 1_000_000 + 2_000_000))
+
+    pooled = []
+    for chrom, start, end in regions:
+        try:
+            pooled.extend(process_region(hic, chrom, start, end, resolution))
+        except Exception as e:
+            summary_lines.append(f"chr{chrom}:{start}-{end} FAILED: {e}")
+
+    summary_lines.append(f"\nTotal domains with a call on both methods: {len(pooled)} (from {len(regions)} regions, 5 chromosomes)")
+
+    proms = [r[0] for r in pooled]
+    perss = [r[1] for r in pooled]
+    ctcf_labels = [1 if r[2] else 0 for r in pooled]
+    cohesin_labels = [1 if r[3] else 0 for r in pooled]
+
+    summary_lines.append(f"Domains with a nearby CTCF peak: {sum(ctcf_labels)} / {len(pooled)}")
+    summary_lines.append(f"Domains with a nearby cohesin (RAD21/SMC3) peak: {sum(cohesin_labels)} / {len(pooled)}")
+
+    summary_lines.append("\n=== Claim 1 (expanded, 22 regions, 5 chromosomes) ===")
+
+    for label_name, labels in [("CTCF", ctcf_labels), ("cohesin (RAD21/SMC3)", cohesin_labels)]:
+        auc_stage1 = rank_auc(proms, labels)
+        auc_stage2 = rank_auc(perss, labels)
+        mean_diff, ci_low, ci_high = bootstrap_auc_diff(proms, perss, labels)
+        summary_lines.append(f"{label_name}:")
+        summary_lines.append(f"  Stage 1 (insulation prominence) AUC = {auc_stage1:.3f}")
+        summary_lines.append(f"  Stage 2 (persistence)           AUC = {auc_stage2:.3f}")
+        summary_lines.append(f"  AUC difference (Stage2 - Stage1): {mean_diff:.3f}  "
+                              f"95% CI [{ci_low:.3f}, {ci_high:.3f}]")
+        if ci_low > 0:
+            summary_lines.append(f"  CI excludes zero -- Stage 2's advantage is unlikely to be chance at this sample size.")
+        elif ci_high < 0:
+            summary_lines.append(f"  CI excludes zero in Stage 1's favor.")
+        else:
+            summary_lines.append(f"  CI includes zero -- still cannot rule out chance.")
+        winner = "Stage 2 (persistence)" if auc_stage2 > auc_stage1 else "Stage 1 (insulation score)"
+        summary_lines.append(f"  Higher point estimate: {winner}\n")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, labels, title in [(axes[0], ctcf_labels, "CTCF"), (axes[1], cohesin_labels, "Cohesin")]:
+        colors = ["red" if l else "gray" for l in labels]
+        ax.scatter(proms, perss, c=colors, alpha=0.5, s=20)
+        ax.set_xlabel("Stage 1: insulation prominence")
+        ax.set_ylabel("Stage 2: persistence")
+        ax.set_title(f"{title} (red = peak nearby), n={len(pooled)}")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    return buf.getvalue(), "\n".join(summary_lines)
+
+
 @app.local_entrypoint()
 def main(task: str = "insulation"):
-    if task == "ctcf_benchmark":
+    if task == "ctcf_benchmark_expanded":
+        image_bytes, summary = run_ctcf_benchmark_expanded.remote()
+        with open("figures/ctcf_benchmark_expanded.png", "wb") as f:
+            f.write(image_bytes)
+        print(summary)
+        print("Saved figures/ctcf_benchmark_expanded.png")
+
+    elif task == "ctcf_benchmark":
         image_bytes, summary = run_ctcf_benchmark.remote()
         with open("figures/ctcf_benchmark.png", "wb") as f:
             f.write(image_bytes)

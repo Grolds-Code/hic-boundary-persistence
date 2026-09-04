@@ -201,3 +201,28 @@ chromosomes. This is not a negative result -- it is the honest,
 correct read of a promising but underpowered first test. More regions
 and more chromosomes are needed before this becomes a claim rather
 than a direction. See modal_app.py (function run_ctcf_benchmark).
+
+## 10. Expanded benchmark -- first statistically significant result
+
+Same CTCF/cohesin benchmark, expanded from 8 regions/2 chromosomes to
+22 regions/5 chromosomes (chr18-22), as a separate function
+(run_ctcf_benchmark_expanded) so the original 8-region result stays
+intact and reproducible on its own. 284 domains total.
+
+Result: CTCF AUC 0.669 (Stage 2) vs 0.555 (Stage 1), difference 0.114,
+95% CI [0.032, 0.196]. Cohesin AUC 0.599 (Stage 2) vs 0.493 (Stage 1),
+difference 0.106, 95% CI [0.013, 0.199]. Both intervals exclude zero.
+
+This is the first statistically significant result in the project
+supporting Claim 1: persistence ranks TAD boundaries in a way that
+better predicts real CTCF and cohesin binding than insulation-score
+prominence does, at this sample size.
+
+Scope of what this does and does not establish: this is 5 of 23
+human chromosomes, one cell line (GM12878), one specific analysis
+design (10kb resolution, +/-20kb peak-proximity window, domains
+filtered to >=5 bins, percentile-50 Stage 1 threshold). It is not yet
+a genome-wide result, and has not been checked for robustness to
+different reasonable choices in that design. Both are the natural
+next steps before this becomes a claim the paper states without
+qualification. See modal_app.py (function run_ctcf_benchmark_expanded).
