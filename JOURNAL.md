@@ -226,3 +226,70 @@ a genome-wide result, and has not been checked for robustness to
 different reasonable choices in that design. Both are the natural
 next steps before this becomes a claim the paper states without
 qualification. See modal_app.py (function run_ctcf_benchmark_expanded).
+
+
+## 11. HCT116 at 500bp -- first successful high-resolution preliminary run
+
+Following Dr. Shamim's instruction to start experimentally at 500bp on
+chr10, tested HCT116 intact Hi-C (ENCFF573OPJ.hic, GRCh38) on
+chr10:20,000,000-21,000,000.
+
+The first attempt failed reproducibly inside hic-straw 1.3.1 with a
+SIGSEGV when calling getRecordsAsMatrix() on the 1Mb region at 500bp.
+Subprocess isolation correctly prevented the native crash from killing
+the parent Modal function, but retrying the same dense call did not help.
+
+A dedicated diagnostic separated the possible causes. HTTP byte-range
+requests to the Hugging Face-hosted file worked correctly, 10kb sparse
+and dense extraction both worked, 500bp extraction over 100kb worked,
+and crucially 500bp sparse extraction over the full 1Mb region also
+worked (94,507 sparse records). Only getRecordsAsMatrix() on the full
+1Mb/500bp query crashed.
+
+Fix: use hic-straw getRecords() and reconstruct the symmetric NumPy
+matrix manually. This workaround was validated directly on a 100kb
+region where both extraction methods work: native and reconstructed
+matrices were both 201x201 with 8,635 non-zero cells, with 0 mismatched
+cells, maximum absolute difference 0.0, and exact array equality.
+
+The full preliminary 500bp run then succeeded:
+- region: chr10:20,000,000-21,000,000
+- matrix shape: 2001x2001
+- sparse records: 94,507
+- overall non-zero fraction: 0.0467
+- H0 features: 100,395 total, 100,394 finite
+- initial top persistence: 25.818
+
+The overall 4.67% density hides strong near-diagonal coverage. Measured
+occupancy by genomic separation was approximately 97.3% at 500bp,
+90.7% at 2kb, 60.9% at 5kb, 36.2% at 10kb, 17.9% at 25kb, 8.7% at
+50kb, 2.7% at 250kb, 1.3% at 500kb, and 0.4% at 750kb.
+
+This exposed a new high-resolution normalization issue. The existing
+distance-stratified z-score includes zero-valued cells at each genomic
+distance. At very sparse long-range diagonals this can make a single
+observed contact receive a very large z-score purely because nearly all
+other cells are zero. At 750kb, only 2/501 cells were non-zero and the
+maximum observed z-score was 15.796, essentially exactly the value
+expected from the occupancy alone for a binary 0/1 diagonal. Therefore
+the initial persistence magnitudes are exploratory and should not yet
+be interpreted as biological boundary strength.
+
+Tested a distance-stratified rank-Gaussian transform as an exploratory
+way to bound this sparsity amplification. It reduced the maximum cell
+score from 25.456 to 3.481, but a distance-preserving shuffled-null test
+showed no useful separation: real maximum H0 persistence was 3.793,
+while three shuffled null maxima were 3.883, 3.883, and 3.882
+(real/null mean-max ratio 0.977). Therefore the rank-Gaussian transform
+is not being adopted as the Stage 2 normalization.
+
+Important interpretation: this null test was run on the entire 1Mb
+matrix, whereas the actual method is two-stage and computes persistence
+inside Stage 1 candidate domains. The next experiment is therefore to
+run Stage 1 insulation at 500bp, inspect candidate-domain sizes, and
+then evaluate Stage 2 within those domains rather than continuing to
+optimize whole-window persistence.
+
+Preliminary figures were generated for the contact map, occupancy by
+genomic separation, and exploratory persistence values and shared with
+Dr. Shamim as the requested first 500bp chr10 result.
